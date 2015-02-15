@@ -103,6 +103,10 @@
 
 #define ETHERMTU	1500
 
+#ifndef ETHERTYPE_TEB
+#define ETHERTYPE_TEB 0x6558
+#endif
+
 #ifndef IPPROTO_HOPOPTS
 #define IPPROTO_HOPOPTS 0
 #endif
@@ -118,6 +122,8 @@
 #ifndef IPPROTO_SCTP
 #define IPPROTO_SCTP 132
 #endif
+
+#define GENEVE_PORT 6081
 
 #ifdef HAVE_OS_PROTO_H
 #include "os-proto.h"
@@ -195,6 +201,7 @@ enum e_offrel {
 	OR_PREVLINKHDR,		/* previous link-layer header */
 	OR_LLC,			/* 802.2 LLC header */
 	OR_PREVMPLSHDR,		/* previous MPLS header */
+	OR_LINKTYPE,		/* link-layer type */
 	OR_LINKPL,		/* link-layer payload */
 	OR_LINKPL_NOSNAP,	/* link-layer payload, with no SNAP header at the link layer */
 	OR_TRAN_IPV4,		/* transport-layer header, with IPv4 network layer */
@@ -310,6 +317,7 @@ static struct slist *xfer_to_a(struct arth *);
 static struct block *gen_mac_multicast(int);
 static struct block *gen_len(int, int);
 static struct block *gen_check_802_11_data_frame(void);
+static struct block *gen_geneve_ll_check(void);
 
 static struct block *gen_ppi_dlt_check(void);
 static struct block *gen_msg_abbrev(int type);
@@ -827,6 +835,7 @@ static bpf_abs_offset off_outermostlinkhdr;
 	off_linkhdr.is_variable = new_is_variable; \
 	off_linkhdr.constant_part = new_constant_part; \
 	off_linkhdr.reg = new_reg; \
+	is_geneve = 0; \
 }
 
 /*
@@ -836,10 +845,8 @@ static bpf_abs_offset off_linkpl;
 
 /*
  * "off_linktype" is the offset to information in the link-layer header
- * giving the packet type.  This offset is relative to the beginning
- * of the link-layer header - i.e., it doesn't include off_linkhdr.constant_part - so
- * loads with an offset that includes "off_linktype" should use
- * OR_LINKHDR.
+ * giving the packet type. This is an absolute offset from the beginning
+ * of the packet.
  *
  * For Ethernet, it's the offset of the Ethernet type field; this
  * means that it must have a value that skips VLAN tags.
@@ -856,14 +863,22 @@ static bpf_abs_offset off_linkpl;
  *
  * For Linux cooked sockets, it's the offset of the type field.
  *
- * It's set to -1 for no encapsulation, in which case, IP is assumed.
+ * off_linktype.constant_part is set to -1 for no encapsulation,
+ * in which case, IP is assumed.
  */
-static u_int off_linktype;
+static bpf_abs_offset off_linktype;
 
 /*
  * TRUE if the link layer includes an ATM pseudo-header.
  */
 static int is_atm = 0;
+
+/*
+ * TRUE if "geneve" appeared in the filter; it causes us to generate
+ * code that checks for a Geneve header and assume that later filters
+ * apply to the encapsulated payload.
+ */
+static int is_geneve = 0;
 
 /*
  * These are offsets for the ATM pseudo-header.
@@ -954,6 +969,10 @@ init_linktype(p)
 	off_linkpl.is_variable = 0;
 	off_linkpl.reg = -1;
 
+	off_linktype.constant_part = 0;
+	off_linktype.is_variable = 0;
+	off_linktype.reg = -1;
+
 	/*
 	 * Assume it's not raw ATM with a pseudo-header, for now.
 	 */
@@ -962,6 +981,11 @@ init_linktype(p)
 	off_vci = -1;
 	off_proto = -1;
 	off_payload = -1;
+
+	/*
+	 * And not Geneve.
+	 */
+	is_geneve = 0;
 
 	/*
 	 * And assume we're not doing SS7.
@@ -979,88 +1003,88 @@ init_linktype(p)
 	switch (linktype) {
 
 	case DLT_ARCNET:
-		off_linktype = 2;
+		off_linktype.constant_part = 2;
 		off_linkpl.constant_part = 6;
 		off_nl = 0;		/* XXX in reality, variable! */
 		off_nl_nosnap = 0;	/* no 802.2 LLC */
-		return;
+		break;
 
 	case DLT_ARCNET_LINUX:
-		off_linktype = 4;
+		off_linktype.constant_part = 4;
 		off_linkpl.constant_part = 8;
 		off_nl = 0;		/* XXX in reality, variable! */
 		off_nl_nosnap = 0;	/* no 802.2 LLC */
-		return;
+		break;
 
 	case DLT_EN10MB:
-		off_linktype = 12;
+		off_linktype.constant_part = 12;
 		off_linkpl.constant_part = 14;	/* Ethernet header length */
 		off_nl = 0;		/* Ethernet II */
 		off_nl_nosnap = 3;	/* 802.3+802.2 */
-		return;
+		break;
 
 	case DLT_SLIP:
 		/*
 		 * SLIP doesn't have a link level type.  The 16 byte
 		 * header is hacked into our SLIP driver.
 		 */
-		off_linktype = -1;
+		off_linktype.constant_part = -1;
 		off_linkpl.constant_part = 16;
 		off_nl = 0;
 		off_nl_nosnap = 0;	/* no 802.2 LLC */
-		return;
+		break;
 
 	case DLT_SLIP_BSDOS:
 		/* XXX this may be the same as the DLT_PPP_BSDOS case */
-		off_linktype = -1;
+		off_linktype.constant_part = -1;
 		/* XXX end */
 		off_linkpl.constant_part = 24;
 		off_nl = 0;
 		off_nl_nosnap = 0;	/* no 802.2 LLC */
-		return;
+		break;
 
 	case DLT_NULL:
 	case DLT_LOOP:
-		off_linktype = 0;
+		off_linktype.constant_part = 0;
 		off_linkpl.constant_part = 4;
 		off_nl = 0;
 		off_nl_nosnap = 0;	/* no 802.2 LLC */
-		return;
+		break;
 
 	case DLT_ENC:
-		off_linktype = 0;
+		off_linktype.constant_part = 0;
 		off_linkpl.constant_part = 12;
 		off_nl = 0;
 		off_nl_nosnap = 0;	/* no 802.2 LLC */
-		return;
+		break;
 
 	case DLT_PPP:
 	case DLT_PPP_PPPD:
 	case DLT_C_HDLC:		/* BSD/OS Cisco HDLC */
 	case DLT_PPP_SERIAL:		/* NetBSD sync/async serial PPP */
-		off_linktype = 2;	/* skip HDLC-like framing */
+		off_linktype.constant_part = 2;	/* skip HDLC-like framing */
 		off_linkpl.constant_part = 4;	/* skip HDLC-like framing and protocol field */
 		off_nl = 0;
 		off_nl_nosnap = 0;	/* no 802.2 LLC */
-		return;
+		break;
 
 	case DLT_PPP_ETHER:
 		/*
 		 * This does no include the Ethernet header, and
 		 * only covers session state.
 		 */
-		off_linktype = 6;
+		off_linktype.constant_part = 6;
 		off_linkpl.constant_part = 8;
 		off_nl = 0;
 		off_nl_nosnap = 0;	/* no 802.2 LLC */
-		return;
+		break;
 
 	case DLT_PPP_BSDOS:
-		off_linktype = 5;
+		off_linktype.constant_part = 5;
 		off_linkpl.constant_part = 24;
 		off_nl = 0;
 		off_nl_nosnap = 0;	/* no 802.2 LLC */
-		return;
+		break;
 
 	case DLT_FDDI:
 		/*
@@ -1071,13 +1095,13 @@ init_linktype(p)
 		 * is being used and pick out the encapsulated Ethernet type.
 		 * XXX - should we generate code to check for SNAP?
 		 */
-		off_linktype = 13;
-		off_linktype += pcap_fddipad;
+		off_linktype.constant_part = 13;
+		off_linktype.constant_part += pcap_fddipad;
 		off_linkpl.constant_part = 13;	/* FDDI MAC header length */
 		off_linkpl.constant_part += pcap_fddipad;
 		off_nl = 8;		/* 802.2+SNAP */
 		off_nl_nosnap = 3;	/* 802.2 */
-		return;
+		break;
 
 	case DLT_IEEE802:
 		/*
@@ -1103,19 +1127,24 @@ init_linktype(p)
 		 * the 16-bit value at an offset of 14 (shifted right
 		 * 8 - figure out which byte that is).
 		 */
-		off_linktype = 14;
+		off_linktype.constant_part = 14;
 		off_linkpl.constant_part = 14;	/* Token Ring MAC header length */
 		off_nl = 8;		/* 802.2+SNAP */
 		off_nl_nosnap = 3;	/* 802.2 */
-		return;
+		break;
 
-	case DLT_IEEE802_11:
 	case DLT_PRISM_HEADER:
 	case DLT_IEEE802_11_RADIO_AVS:
 	case DLT_IEEE802_11_RADIO:
+		off_linkhdr.is_variable = 1;
+		/* Fall through, 802.11 doesn't have a variable link
+		 * prefix but is otherwise the same. */
+
+	case DLT_IEEE802_11:
 		/*
 		 * 802.11 doesn't really have a link-level type field.
-		 * We set "off_linktype" to the offset of the LLC header.
+		 * We set "off_linktype.constant_part" to the offset of
+		 * the LLC header.
 		 *
 		 * To check for Ethernet types, we assume that SSAP = SNAP
 		 * is being used and pick out the encapsulated Ethernet type.
@@ -1130,12 +1159,12 @@ init_linktype(p)
 		 * header or an AVS header, so, in practice, it's
 		 * variable-length.
 		 */
-		off_linktype = 24;
+		off_linktype.constant_part = 24;
 		off_linkpl.constant_part = 0;	/* link-layer header is variable-length */
 		off_linkpl.is_variable = 1;
 		off_nl = 8;		/* 802.2+SNAP */
 		off_nl_nosnap = 3;	/* 802.2 */
-		return;
+		break;
 
 	case DLT_PPI:
 		/*
@@ -1147,12 +1176,13 @@ init_linktype(p)
 		 * the encapsulated DLT should be DLT_IEEE802_11) we
 		 * generate code to check for this too.
 		 */
-		off_linktype = 24;
+		off_linktype.constant_part = 24;
 		off_linkpl.constant_part = 0;	/* link-layer header is variable-length */
 		off_linkpl.is_variable = 1;
+		off_linkhdr.is_variable = 1;
 		off_nl = 8;		/* 802.2+SNAP */
 		off_nl_nosnap = 3;	/* 802.2 */
-		return;
+		break;
 
 	case DLT_ATM_RFC1483:
 	case DLT_ATM_CLIP:	/* Linux ATM defines this */
@@ -1167,11 +1197,11 @@ init_linktype(p)
 		 * or "pppoa and tcp port 80" and have it check for
 		 * PPPo{A,E} and a PPP protocol of IP and....
 		 */
-		off_linktype = 0;
+		off_linktype.constant_part = 0;
 		off_linkpl.constant_part = 0;	/* packet begins with LLC header */
 		off_nl = 8;		/* 802.2+SNAP */
 		off_nl_nosnap = 3;	/* 802.2 */
-		return;
+		break;
 
 	case DLT_SUNATM:
 		/*
@@ -1183,27 +1213,27 @@ init_linktype(p)
 		off_vci = SUNATM_VCI_POS;
 		off_proto = PROTO_POS;
 		off_payload = SUNATM_PKT_BEGIN_POS;
-		off_linktype = off_payload;
+		off_linktype.constant_part = off_payload;
 		off_linkpl.constant_part = off_payload;	/* if LLC-encapsulated */
 		off_nl = 8;		/* 802.2+SNAP */
 		off_nl_nosnap = 3;	/* 802.2 */
-		return;
+		break;
 
 	case DLT_RAW:
 	case DLT_IPV4:
 	case DLT_IPV6:
-		off_linktype = -1;
+		off_linktype.constant_part = -1;
 		off_linkpl.constant_part = 0;
 		off_nl = 0;
 		off_nl_nosnap = 0;	/* no 802.2 LLC */
-		return;
+		break;
 
 	case DLT_LINUX_SLL:	/* fake header for Linux cooked socket */
-		off_linktype = 14;
+		off_linktype.constant_part = 14;
 		off_linkpl.constant_part = 16;
 		off_nl = 0;
 		off_nl_nosnap = 0;	/* no 802.2 LLC */
-		return;
+		break;
 
 	case DLT_LTALK:
 		/*
@@ -1211,11 +1241,11 @@ init_linktype(p)
 		 * but really it just indicates whether there is a "short" or
 		 * "long" DDP packet following.
 		 */
-		off_linktype = -1;
+		off_linktype.constant_part = -1;
 		off_linkpl.constant_part = 0;
 		off_nl = 0;
 		off_nl_nosnap = 0;	/* no 802.2 LLC */
-		return;
+		break;
 
 	case DLT_IP_OVER_FC:
 		/*
@@ -1228,22 +1258,22 @@ init_linktype(p)
 		 * XXX - should we generate code to check for SNAP? RFC
 		 * 2625 says SNAP should be used.
 		 */
-		off_linktype = 16;
+		off_linktype.constant_part = 16;
 		off_linkpl.constant_part = 16;
 		off_nl = 8;		/* 802.2+SNAP */
 		off_nl_nosnap = 3;	/* 802.2 */
-		return;
+		break;
 
 	case DLT_FRELAY:
 		/*
 		 * XXX - we should set this to handle SNAP-encapsulated
 		 * frames (NLPID of 0x80).
 		 */
-		off_linktype = -1;
+		off_linktype.constant_part = -1;
 		off_linkpl.constant_part = 0;
 		off_nl = 0;
 		off_nl_nosnap = 0;	/* no 802.2 LLC */
-		return;
+		break;
 
                 /*
                  * the only BPF-interesting FRF.16 frames are non-control frames;
@@ -1251,33 +1281,33 @@ init_linktype(p)
                  * so lets start with offset 4 for now and increments later on (FIXME);
                  */
 	case DLT_MFR:
-		off_linktype = -1;
+		off_linktype.constant_part = -1;
 		off_linkpl.constant_part = 0;
 		off_nl = 4;
 		off_nl_nosnap = 0;	/* XXX - for now -> no 802.2 LLC */
-		return;
+		break;
 
 	case DLT_APPLE_IP_OVER_IEEE1394:
-		off_linktype = 16;
+		off_linktype.constant_part = 16;
 		off_linkpl.constant_part = 18;
 		off_nl = 0;
 		off_nl_nosnap = 0;	/* no 802.2 LLC */
-		return;
+		break;
 
 	case DLT_SYMANTEC_FIREWALL:
-		off_linktype = 6;
+		off_linktype.constant_part = 6;
 		off_linkpl.constant_part = 44;
 		off_nl = 0;		/* Ethernet II */
 		off_nl_nosnap = 0;	/* XXX - what does it do with 802.3 packets? */
-		return;
+		break;
 
 #ifdef HAVE_NET_PFVAR_H
 	case DLT_PFLOG:
-		off_linktype = 0;
+		off_linktype.constant_part = 0;
 		off_linkpl.constant_part = PFLOG_HDRLEN;
 		off_nl = 0;
 		off_nl_nosnap = 0;	/* no 802.2 LLC */
-		return;
+		break;
 #endif
 
         case DLT_JUNIPER_MFR:
@@ -1286,108 +1316,108 @@ init_linktype(p)
         case DLT_JUNIPER_PPP:
         case DLT_JUNIPER_CHDLC:
         case DLT_JUNIPER_FRELAY:
-                off_linktype = 4;
+                off_linktype.constant_part = 4;
 		off_linkpl.constant_part = 4;
 		off_nl = 0;
 		off_nl_nosnap = -1;	/* no 802.2 LLC */
-                return;
+                break;
 
 	case DLT_JUNIPER_ATM1:
-		off_linktype = 4;		/* in reality variable between 4-8 */
+		off_linktype.constant_part = 4;		/* in reality variable between 4-8 */
 		off_linkpl.constant_part = 4;	/* in reality variable between 4-8 */
 		off_nl = 0;
 		off_nl_nosnap = 10;
-		return;
+		break;
 
 	case DLT_JUNIPER_ATM2:
-		off_linktype = 8;		/* in reality variable between 8-12 */
+		off_linktype.constant_part = 8;		/* in reality variable between 8-12 */
 		off_linkpl.constant_part = 8;	/* in reality variable between 8-12 */
 		off_nl = 0;
 		off_nl_nosnap = 10;
-		return;
+		break;
 
 		/* frames captured on a Juniper PPPoE service PIC
 		 * contain raw ethernet frames */
 	case DLT_JUNIPER_PPPOE:
         case DLT_JUNIPER_ETHER:
         	off_linkpl.constant_part = 14;
-		off_linktype = 16;
+		off_linktype.constant_part = 16;
 		off_nl = 18;		/* Ethernet II */
 		off_nl_nosnap = 21;	/* 802.3+802.2 */
-		return;
+		break;
 
 	case DLT_JUNIPER_PPPOE_ATM:
-		off_linktype = 4;
+		off_linktype.constant_part = 4;
 		off_linkpl.constant_part = 6;
 		off_nl = 0;
 		off_nl_nosnap = -1;	/* no 802.2 LLC */
-		return;
+		break;
 
 	case DLT_JUNIPER_GGSN:
-		off_linktype = 6;
+		off_linktype.constant_part = 6;
 		off_linkpl.constant_part = 12;
 		off_nl = 0;
 		off_nl_nosnap = -1;	/* no 802.2 LLC */
-		return;
+		break;
 
 	case DLT_JUNIPER_ES:
-		off_linktype = 6;
+		off_linktype.constant_part = 6;
 		off_linkpl.constant_part = -1;	/* not really a network layer but raw IP addresses */
 		off_nl = -1;		/* not really a network layer but raw IP addresses */
 		off_nl_nosnap = -1;	/* no 802.2 LLC */
-		return;
+		break;
 
 	case DLT_JUNIPER_MONITOR:
-		off_linktype = 12;
+		off_linktype.constant_part = 12;
 		off_linkpl.constant_part = 12;
 		off_nl = 0;		/* raw IP/IP6 header */
 		off_nl_nosnap = -1;	/* no 802.2 LLC */
-		return;
+		break;
 
 	case DLT_BACNET_MS_TP:
-		off_linktype = -1;
+		off_linktype.constant_part = -1;
 		off_linkpl.constant_part = -1;
 		off_nl = -1;
 		off_nl_nosnap = -1;
-		return;
+		break;
 
 	case DLT_JUNIPER_SERVICES:
-		off_linktype = 12;
+		off_linktype.constant_part = 12;
 		off_linkpl.constant_part = -1;	/* L3 proto location dep. on cookie type */
 		off_nl = -1;		/* L3 proto location dep. on cookie type */
 		off_nl_nosnap = -1;	/* no 802.2 LLC */
-		return;
+		break;
 
 	case DLT_JUNIPER_VP:
-		off_linktype = 18;
+		off_linktype.constant_part = 18;
 		off_linkpl.constant_part = -1;
 		off_nl = -1;
 		off_nl_nosnap = -1;
-		return;
+		break;
 
 	case DLT_JUNIPER_ST:
-		off_linktype = 18;
+		off_linktype.constant_part = 18;
 		off_linkpl.constant_part = -1;
 		off_nl = -1;
 		off_nl_nosnap = -1;
-		return;
+		break;
 
 	case DLT_JUNIPER_ISM:
-		off_linktype = 8;
+		off_linktype.constant_part = 8;
 		off_linkpl.constant_part = -1;
 		off_nl = -1;
 		off_nl_nosnap = -1;
-		return;
+		break;
 
 	case DLT_JUNIPER_VS:
 	case DLT_JUNIPER_SRX_E2E:
 	case DLT_JUNIPER_FIBRECHANNEL:
 	case DLT_JUNIPER_ATM_CEMIC:
-		off_linktype = 8;
+		off_linktype.constant_part = 8;
 		off_linkpl.constant_part = -1;
 		off_nl = -1;
 		off_nl_nosnap = -1;
-		return;
+		break;
 
 	case DLT_MTP2:
 		off_li = 2;
@@ -1396,11 +1426,11 @@ init_linktype(p)
 		off_opc = 4;
 		off_dpc = 4;
 		off_sls = 7;
-		off_linktype = -1;
+		off_linktype.constant_part = -1;
 		off_linkpl.constant_part = -1;
 		off_nl = -1;
 		off_nl_nosnap = -1;
-		return;
+		break;
 
 	case DLT_MTP2_WITH_PHDR:
 		off_li = 6;
@@ -1409,11 +1439,11 @@ init_linktype(p)
 		off_opc = 8;
 		off_dpc = 8;
 		off_sls = 11;
-		off_linktype = -1;
+		off_linktype.constant_part = -1;
 		off_linkpl.constant_part = -1;
 		off_nl = -1;
 		off_nl_nosnap = -1;
-		return;
+		break;
 
 	case DLT_ERF:
 		off_li = 22;
@@ -1422,51 +1452,51 @@ init_linktype(p)
 		off_opc = 24;
 		off_dpc = 24;
 		off_sls = 27;
-		off_linktype = -1;
+		off_linktype.constant_part = -1;
 		off_linkpl.constant_part = -1;
 		off_nl = -1;
 		off_nl_nosnap = -1;
-		return;
+		break;
 
 	case DLT_PFSYNC:
-		off_linktype = -1;
+		off_linktype.constant_part = -1;
 		off_linkpl.constant_part = 4;
 		off_nl = 0;
 		off_nl_nosnap = 0;
-		return;
+		break;
 
 	case DLT_AX25_KISS:
 		/*
 		 * Currently, only raw "link[N:M]" filtering is supported.
 		 */
-		off_linktype = -1;	/* variable, min 15, max 71 steps of 7 */
+		off_linktype.constant_part = -1;	/* variable, min 15, max 71 steps of 7 */
 		off_linkpl.constant_part = -1;
 		off_nl = -1;		/* variable, min 16, max 71 steps of 7 */
 		off_nl_nosnap = -1;	/* no 802.2 LLC */
-		return;
+		break;
 
 	case DLT_IPNET:
-		off_linktype = 1;
+		off_linktype.constant_part = 1;
 		off_linkpl.constant_part = 24;	/* ipnet header length */
 		off_nl = 0;
 		off_nl_nosnap = -1;
-		return;
+		break;
 
 	case DLT_NETANALYZER:
 		off_linkhdr.constant_part = 4;	/* Ethernet header is past 4-byte pseudo-header */
-		off_linktype = 12;
+		off_linktype.constant_part = off_linkhdr.constant_part + 12;
 		off_linkpl.constant_part = off_linkhdr.constant_part + 14;	/* pseudo-header+Ethernet header length */
 		off_nl = 0;		/* Ethernet II */
 		off_nl_nosnap = 3;	/* 802.3+802.2 */
-		return;
+		break;
 
 	case DLT_NETANALYZER_TRANSPARENT:
 		off_linkhdr.constant_part = 12;	/* MAC header is past 4-byte pseudo-header, preamble, and SFD */
-		off_linktype = 12;
+		off_linktype.constant_part = off_linkhdr.constant_part + 12;
 		off_linkpl.constant_part = off_linkhdr.constant_part + 14;	/* pseudo-header+preamble+SFD+Ethernet header length */
 		off_nl = 0;		/* Ethernet II */
 		off_nl_nosnap = 3;	/* 802.3+802.2 */
-		return;
+		break;
 
 	default:
 		/*
@@ -1475,16 +1505,17 @@ init_linktype(p)
 		 */
 		if (linktype >= DLT_MATCHING_MIN &&
 		    linktype <= DLT_MATCHING_MAX) {
-			off_linktype = -1;
+			off_linktype.constant_part = -1;
 			off_linkpl.constant_part = -1;
 			off_nl = -1;
 			off_nl_nosnap = -1;
-			return;
+		} else {
+			bpf_error("unknown data link type %d", linktype);
 		}
-
+		break;
 	}
-	bpf_error("unknown data link type %d", linktype);
-	/* NOTREACHED */
+
+	off_outermostlinkhdr = off_prevlinkhdr = off_linkhdr;
 }
 
 /*
@@ -1567,6 +1598,10 @@ gen_load_a(offrel, offset, size)
 		s = gen_load_absoffsetrel(&off_linkpl, off_nl_nosnap + offset, size);
 		break;
 
+	case OR_LINKTYPE:
+		s = gen_load_absoffsetrel(&off_linktype, offset, size);
+		break;
+
 	case OR_TRAN_IPV4:
 		/*
 		 * Load the X register with the length of the IPv4 header
@@ -1626,7 +1661,7 @@ gen_loadx_iphdrlen()
 		 * the value from the X register.
 		 */
 		s2 = new_stmt(BPF_LD|BPF_IND|BPF_B);
-		s2->s.k = off_nl;
+		s2->s.k = off_linkpl.constant_part + off_nl;
 		sappend(s, s2);
 		s2 = new_stmt(BPF_ALU|BPF_AND|BPF_K);
 		s2->s.k = 0xf;
@@ -1729,7 +1764,7 @@ gen_ether_linktype(proto)
 		 * DSAP, as we do for other types <= ETHERMTU
 		 * (i.e., other SAP values)?
 		 */
-		b0 = gen_cmp_gt(OR_LINKHDR, off_linktype, BPF_H, ETHERMTU);
+		b0 = gen_cmp_gt(OR_LINKTYPE, 0, BPF_H, ETHERMTU);
 		gen_not(b0);
 		b1 = gen_cmp(OR_LLC, 0, BPF_H, (bpf_int32)
 			     ((proto << 8) | proto));
@@ -1784,7 +1819,7 @@ gen_ether_linktype(proto)
 		 * Now we generate code to check for 802.3
 		 * frames in general.
 		 */
-		b0 = gen_cmp_gt(OR_LINKHDR, off_linktype, BPF_H, ETHERMTU);
+		b0 = gen_cmp_gt(OR_LINKTYPE, 0, BPF_H, ETHERMTU);
 		gen_not(b0);
 
 		/*
@@ -1800,8 +1835,7 @@ gen_ether_linktype(proto)
 		 * do that before checking for the other frame
 		 * types.
 		 */
-		b0 = gen_cmp(OR_LINKHDR, off_linktype, BPF_H,
-		    (bpf_int32)ETHERTYPE_IPX);
+		b0 = gen_cmp(OR_LINKTYPE, 0, BPF_H, (bpf_int32)ETHERTYPE_IPX);
 		gen_or(b0, b1);
 		return b1;
 
@@ -1817,7 +1851,7 @@ gen_ether_linktype(proto)
 		 * we check for an Ethernet type field less than
 		 * 1500, which means it's an 802.3 length field.
 		 */
-		b0 = gen_cmp_gt(OR_LINKHDR, off_linktype, BPF_H, ETHERMTU);
+		b0 = gen_cmp_gt(OR_LINKTYPE, 0, BPF_H, ETHERMTU);
 		gen_not(b0);
 
 		/*
@@ -1842,7 +1876,7 @@ gen_ether_linktype(proto)
 		 * phase 1?); we just check for the Ethernet
 		 * protocol type.
 		 */
-		b0 = gen_cmp(OR_LINKHDR, off_linktype, BPF_H, (bpf_int32)proto);
+		b0 = gen_cmp(OR_LINKTYPE, 0, BPF_H, (bpf_int32)proto);
 
 		gen_or(b0, b1);
 		return b1;
@@ -1857,10 +1891,9 @@ gen_ether_linktype(proto)
 			 * a length field, <= ETHERMTU) and
 			 * then check the DSAP.
 			 */
-			b0 = gen_cmp_gt(OR_LINKHDR, off_linktype, BPF_H, ETHERMTU);
+			b0 = gen_cmp_gt(OR_LINKTYPE, 0, BPF_H, ETHERMTU);
 			gen_not(b0);
-			b1 = gen_cmp(OR_LINKHDR, off_linktype + 2, BPF_B,
-			    (bpf_int32)proto);
+			b1 = gen_cmp(OR_LINKTYPE, 2, BPF_B, (bpf_int32)proto);
 			gen_and(b0, b1);
 			return b1;
 		} else {
@@ -1873,7 +1906,7 @@ gen_ether_linktype(proto)
 			 * will fail and the frame won't match,
 			 * which is what we want).
 			 */
-			return gen_cmp(OR_LINKHDR, off_linktype, BPF_H,
+			return gen_cmp(OR_LINKTYPE, 0, BPF_H,
 			    (bpf_int32)proto);
 		}
 	}
@@ -1890,12 +1923,11 @@ gen_ipnet_linktype(proto)
 	switch (proto) {
 
 	case ETHERTYPE_IP:
-		return gen_cmp(OR_LINKHDR, off_linktype, BPF_B,
-		    (bpf_int32)IPH_AF_INET);
+		return gen_cmp(OR_LINKTYPE, 0, BPF_B, (bpf_int32)IPH_AF_INET);
 		/* NOTREACHED */
 
 	case ETHERTYPE_IPV6:
-		return gen_cmp(OR_LINKHDR, off_linktype, BPF_B,
+		return gen_cmp(OR_LINKTYPE, 0, BPF_B,
 		    (bpf_int32)IPH_AF_INET6);
 		/* NOTREACHED */
 
@@ -1937,7 +1969,7 @@ gen_linux_sll_linktype(proto)
 		 * DSAP, as we do for other types <= ETHERMTU
 		 * (i.e., other SAP values)?
 		 */
-		b0 = gen_cmp(OR_LINKHDR, off_linktype, BPF_H, LINUX_SLL_P_802_2);
+		b0 = gen_cmp(OR_LINKTYPE, 0, BPF_H, LINUX_SLL_P_802_2);
 		b1 = gen_cmp(OR_LLC, 0, BPF_H, (bpf_int32)
 			     ((proto << 8) | proto));
 		gen_and(b0, b1);
@@ -1972,14 +2004,14 @@ gen_linux_sll_linktype(proto)
 		b0 = gen_cmp(OR_LLC, 0, BPF_B, (bpf_int32)LLCSAP_IPX);
 		b1 = gen_snap(0x000000, ETHERTYPE_IPX);
 		gen_or(b0, b1);
-		b0 = gen_cmp(OR_LINKHDR, off_linktype, BPF_H, LINUX_SLL_P_802_2);
+		b0 = gen_cmp(OR_LINKTYPE, 0, BPF_H, LINUX_SLL_P_802_2);
 		gen_and(b0, b1);
 
 		/*
 		 * Now check for 802.3 frames and OR that with
 		 * the previous test.
 		 */
-		b0 = gen_cmp(OR_LINKHDR, off_linktype, BPF_H, LINUX_SLL_P_802_3);
+		b0 = gen_cmp(OR_LINKTYPE, 0, BPF_H, LINUX_SLL_P_802_3);
 		gen_or(b0, b1);
 
 		/*
@@ -1987,8 +2019,7 @@ gen_linux_sll_linktype(proto)
 		 * do that before checking for the other frame
 		 * types.
 		 */
-		b0 = gen_cmp(OR_LINKHDR, off_linktype, BPF_H,
-		    (bpf_int32)ETHERTYPE_IPX);
+		b0 = gen_cmp(OR_LINKTYPE, 0, BPF_H, (bpf_int32)ETHERTYPE_IPX);
 		gen_or(b0, b1);
 		return b1;
 
@@ -2004,7 +2035,7 @@ gen_linux_sll_linktype(proto)
 		 * we check for the 802.2 protocol type in the
 		 * "Ethernet type" field.
 		 */
-		b0 = gen_cmp(OR_LINKHDR, off_linktype, BPF_H, LINUX_SLL_P_802_2);
+		b0 = gen_cmp(OR_LINKTYPE, 0, BPF_H, LINUX_SLL_P_802_2);
 
 		/*
 		 * 802.2-encapsulated ETHERTYPE_ATALK packets are
@@ -2028,7 +2059,7 @@ gen_linux_sll_linktype(proto)
 		 * phase 1?); we just check for the Ethernet
 		 * protocol type.
 		 */
-		b0 = gen_cmp(OR_LINKHDR, off_linktype, BPF_H, (bpf_int32)proto);
+		b0 = gen_cmp(OR_LINKTYPE, 0, BPF_H, (bpf_int32)proto);
 
 		gen_or(b0, b1);
 		return b1;
@@ -2042,8 +2073,7 @@ gen_linux_sll_linktype(proto)
 			 * in the "Ethernet type" field, and
 			 * then check the DSAP.
 			 */
-			b0 = gen_cmp(OR_LINKHDR, off_linktype, BPF_H,
-			    LINUX_SLL_P_802_2);
+			b0 = gen_cmp(OR_LINKTYPE, 0, BPF_H, LINUX_SLL_P_802_2);
 			b1 = gen_cmp(OR_LINKHDR, off_linkpl.constant_part, BPF_B,
 			     (bpf_int32)proto);
 			gen_and(b0, b1);
@@ -2058,8 +2088,7 @@ gen_linux_sll_linktype(proto)
 			 * will fail and the frame won't match,
 			 * which is what we want).
 			 */
-			return gen_cmp(OR_LINKHDR, off_linktype, BPF_H,
-			    (bpf_int32)proto);
+			return gen_cmp(OR_LINKTYPE, 0, BPF_H, (bpf_int32)proto);
 		}
 	}
 }
@@ -2570,6 +2599,15 @@ insert_compute_vloffsets(b)
 {
 	struct slist *s;
 
+	/* There is an implicit dependency between the link
+	 * payload and link header since the payload computation
+	 * includes the variable part of the header. Therefore,
+	 * if nobody else has allocated a register for the link
+	 * header and we need it, do it now. */
+	if (off_linkpl.reg != -1 && off_linkhdr.is_variable &&
+	    off_linkhdr.reg == -1)
+		off_linkhdr.reg = alloc_reg();
+
 	/*
 	 * For link-layer types that have a variable-length header
 	 * preceding the link-layer header, generate code to load
@@ -2762,6 +2800,9 @@ gen_prevlinkhdr_check(void)
 {
 	struct block *b0;
 
+	if (is_geneve)
+		return gen_geneve_ll_check();
+
 	switch (prevlinktype) {
 
 	case DLT_SUNATM:
@@ -2823,7 +2864,13 @@ gen_linktype(proto)
 	case DLT_EN10MB:
 	case DLT_NETANALYZER:
 	case DLT_NETANALYZER_TRANSPARENT:
-		b0 = gen_prevlinkhdr_check();
+		/* Geneve has an EtherType regardless of whether there is an
+		 * L2 header. */
+		if (!is_geneve)
+			b0 = gen_prevlinkhdr_check();
+		else
+			b0 = NULL;
+
 		b1 = gen_ether_linktype(proto);
 		if (b0 != NULL)
 			gen_and(b0, b1);
@@ -2839,8 +2886,7 @@ gen_linktype(proto)
 			/* fall through */
 
 		default:
-			return gen_cmp(OR_LINKHDR, off_linktype, BPF_H,
-			    (bpf_int32)proto);
+			return gen_cmp(OR_LINKTYPE, 0, BPF_H, (bpf_int32)proto);
 			/*NOTREACHED*/
 			break;
 		}
@@ -2967,7 +3013,7 @@ gen_linktype(proto)
 		 * map them to the corresponding PPP protocol types.
 		 */
 		proto = ethertype_to_ppptype(proto);
-		return gen_cmp(OR_LINKHDR, off_linktype, BPF_H, (bpf_int32)proto);
+		return gen_cmp(OR_LINKTYPE, 0, BPF_H, (bpf_int32)proto);
 		/*NOTREACHED*/
 		break;
 
@@ -2983,16 +3029,16 @@ gen_linktype(proto)
 			 * Also check for Van Jacobson-compressed IP.
 			 * XXX - do this for other forms of PPP?
 			 */
-			b0 = gen_cmp(OR_LINKHDR, off_linktype, BPF_H, PPP_IP);
-			b1 = gen_cmp(OR_LINKHDR, off_linktype, BPF_H, PPP_VJC);
+			b0 = gen_cmp(OR_LINKTYPE, 0, BPF_H, PPP_IP);
+			b1 = gen_cmp(OR_LINKTYPE, 0, BPF_H, PPP_VJC);
 			gen_or(b0, b1);
-			b0 = gen_cmp(OR_LINKHDR, off_linktype, BPF_H, PPP_VJNC);
+			b0 = gen_cmp(OR_LINKTYPE, 0, BPF_H, PPP_VJNC);
 			gen_or(b1, b0);
 			return b0;
 
 		default:
 			proto = ethertype_to_ppptype(proto);
-			return gen_cmp(OR_LINKHDR, off_linktype, BPF_H,
+			return gen_cmp(OR_LINKTYPE, 0, BPF_H,
 				(bpf_int32)proto);
 		}
 		/*NOTREACHED*/
@@ -3093,31 +3139,31 @@ gen_linktype(proto)
 			return gen_false();
 
 		case ETHERTYPE_IPV6:
-			return (gen_cmp(OR_LINKHDR, off_linktype, BPF_B,
+			return (gen_cmp(OR_LINKTYPE, 0, BPF_B,
 				(bpf_int32)ARCTYPE_INET6));
 
 		case ETHERTYPE_IP:
-			b0 = gen_cmp(OR_LINKHDR, off_linktype, BPF_B,
+			b0 = gen_cmp(OR_LINKTYPE, 0, BPF_B,
 				     (bpf_int32)ARCTYPE_IP);
-			b1 = gen_cmp(OR_LINKHDR, off_linktype, BPF_B,
+			b1 = gen_cmp(OR_LINKTYPE, 0, BPF_B,
 				     (bpf_int32)ARCTYPE_IP_OLD);
 			gen_or(b0, b1);
 			return (b1);
 
 		case ETHERTYPE_ARP:
-			b0 = gen_cmp(OR_LINKHDR, off_linktype, BPF_B,
+			b0 = gen_cmp(OR_LINKTYPE, 0, BPF_B,
 				     (bpf_int32)ARCTYPE_ARP);
-			b1 = gen_cmp(OR_LINKHDR, off_linktype, BPF_B,
+			b1 = gen_cmp(OR_LINKTYPE, 0, BPF_B,
 				     (bpf_int32)ARCTYPE_ARP_OLD);
 			gen_or(b0, b1);
 			return (b1);
 
 		case ETHERTYPE_REVARP:
-			return (gen_cmp(OR_LINKHDR, off_linktype, BPF_B,
+			return (gen_cmp(OR_LINKTYPE, 0, BPF_B,
 					(bpf_int32)ARCTYPE_REVARP));
 
 		case ETHERTYPE_ATALK:
-			return (gen_cmp(OR_LINKHDR, off_linktype, BPF_B,
+			return (gen_cmp(OR_LINKTYPE, 0, BPF_B,
 					(bpf_int32)ARCTYPE_ATALK));
 		}
 		/*NOTREACHED*/
@@ -3282,16 +3328,16 @@ gen_linktype(proto)
 		/*
 		 * Does this link-layer header type have a field
 		 * indicating the type of the next protocol?  If
-		 * so, off_linktype will be the offset of that
+		 * so, off_linktype.constant_part will be the offset of that
 		 * field in the packet; if not, it will be -1.
 		 */
-		if (off_linktype != (u_int)-1) {
+		if (off_linktype.constant_part != (u_int)-1) {
 			/*
 			 * Yes; assume it's an Ethernet type.  (If
 			 * it's not, it needs to be handled specially
 			 * above.)
 			 */
-			return gen_cmp(OR_LINKHDR, off_linktype, BPF_H, (bpf_int32)proto);
+			return gen_cmp(OR_LINKTYPE, 0, BPF_H, (bpf_int32)proto);
 		} else {
 			/*
 			 * No; report an error.
@@ -3349,7 +3395,7 @@ gen_llc(void)
 		 * We check for an Ethernet type field less than
 		 * 1500, which means it's an 802.3 length field.
 		 */
-		b0 = gen_cmp_gt(OR_LINKHDR, off_linktype, BPF_H, ETHERMTU);
+		b0 = gen_cmp_gt(OR_LINKTYPE, 0, BPF_H, ETHERMTU);
 		gen_not(b0);
 
 		/*
@@ -5766,15 +5812,8 @@ gen_protochain(v, proto, dir)
 	 * branches, and backward branch support is unlikely to appear
 	 * in kernel BPF engines.)
 	 */
-	switch (linktype) {
-
-	case DLT_IEEE802_11:
-	case DLT_PRISM_HEADER:
-	case DLT_IEEE802_11_RADIO_AVS:
-	case DLT_IEEE802_11_RADIO:
-	case DLT_PPI:
-		bpf_error("'protochain' not supported with 802.11");
-	}
+	if (off_linkpl.is_variable)
+		bpf_error("'protochain' not supported with variable length headers");
 
 	no_optimize = 1; /*this code is not compatible with optimzer yet */
 
@@ -6386,7 +6425,8 @@ gen_scode(name, q)
 			if (alist == NULL || *alist == NULL)
 				bpf_error("unknown host '%s'", name);
 			tproto = proto;
-			if (off_linktype == (u_int)-1 && tproto == Q_DEFAULT)
+			if (off_linktype.constant_part == (u_int)-1 &&
+			    tproto == Q_DEFAULT)
 				tproto = Q_IP;
 			b = gen_host(**alist++, 0xffffffff, tproto, dir, q.addr);
 			while (*alist) {
@@ -6404,7 +6444,8 @@ gen_scode(name, q)
 			ai = res;
 			b = tmp = NULL;
 			tproto = tproto6 = proto;
-			if (off_linktype == -1 && tproto == Q_DEFAULT) {
+			if (off_linktype.constant_part == -1 &&
+			    tproto == Q_DEFAULT) {
 				tproto = Q_IP;
 				tproto6 = Q_IPV6;
 			}
@@ -8118,7 +8159,7 @@ gen_vlan_no_bpf_extensions(int vlan_num)
 	 * The link-layer type information follows the VLAN tags, so
 	 * skip past this VLAN tag.
 	 */
-        off_linktype += 4;
+        off_linktype.constant_part += 4;
 
         return b0;
 }
@@ -8173,7 +8214,11 @@ gen_vlan(vlan_num)
 	case DLT_NETANALYZER:
 	case DLT_NETANALYZER_TRANSPARENT:
 #if defined(SKF_AD_VLAN_TAG) && defined(SKF_AD_VLAN_TAG_PRESENT)
-		if (vlan_stack_depth == 0) {
+		/* Verify that this is the outer part of the packet and
+		 * not encapsulated somehow. */
+		if (vlan_stack_depth == 0 && !off_linkhdr.is_variable &&
+		    off_linkhdr.constant_part ==
+		    off_outermostlinkhdr.constant_part) {
 			/*
 			 * Do we need special VLAN handling?
 			 */
@@ -8348,11 +8393,305 @@ gen_pppoes(sess_num)
 	    off_linkpl.constant_part + off_nl + 6, /* 6 bytes past the PPPoE header */
 	    off_linkpl.reg);
 
-	off_linktype = 0;
+	off_linktype = off_linkhdr;
 	off_linkpl.constant_part = off_linkhdr.constant_part + 2;
 
 	off_nl = 0;
 	off_nl_nosnap = 0;	/* no 802.2 LLC */
+
+	return b0;
+}
+
+/* Check that this is Geneve and the VNI is correct if
+ * specified. Parameterized to handle both IPv4 and IPv6. */
+static struct block *
+gen_geneve_check(struct block *(*gen_portfn)(int, int, int),
+		 enum e_offrel offrel, int vni)
+{
+	struct block *b0, *b1;
+
+	b0 = gen_portfn(GENEVE_PORT, IPPROTO_UDP, Q_DST);
+
+	/* Check that we are operating on version 0. Otherwise, we
+	 * can't decode the rest of the fields. The version is 2 bits
+	 * in the first byte of the Geneve header. */
+	b1 = gen_mcmp(offrel, 8, BPF_B, (bpf_int32)0, 0xc0);
+	gen_and(b0, b1);
+	b0 = b1;
+
+	if (vni >= 0) {
+		vni <<= 8; /* VNI is in the upper 3 bytes */
+		b1 = gen_mcmp(offrel, 12, BPF_W, (bpf_int32)vni,
+			      0xffffff00);
+		gen_and(b0, b1);
+		b0 = b1;
+	}
+
+	return b0;
+}
+
+/* The IPv4 and IPv6 Geneve checks need to do two things:
+ * - Verify that this actually is Geneve with the right VNI.
+ * - Place the IP header length (plus variable link prefix if
+ *   needed) into register A to be used later to compute
+ *   the inner packet offsets. */
+static struct block *
+gen_geneve4(int vni)
+{
+	struct block *b0, *b1;
+	struct slist *s, *s1;
+
+	b0 = gen_geneve_check(gen_port, OR_TRAN_IPV4, vni);
+
+	/* Load the IP header length into A. */
+	s = gen_loadx_iphdrlen();
+
+	s1 = new_stmt(BPF_MISC|BPF_TXA);
+	sappend(s, s1);
+
+	/* Forcibly append these statements to the true condition
+	 * of the protocol check by creating a new block that is
+	 * always true and ANDing them. */
+	b1 = new_block(BPF_JMP|BPF_JEQ|BPF_X);
+	b1->stmts = s;
+	b1->s.k = 0;
+
+	gen_and(b0, b1);
+
+	return b1;
+}
+
+static struct block *
+gen_geneve6(int vni)
+{
+	struct block *b0, *b1;
+	struct slist *s, *s1;
+
+	b0 = gen_geneve_check(gen_port6, OR_TRAN_IPV6, vni);
+
+	/* Load the IP header length. We need to account for a
+	 * variable length link prefix if there is one. */
+	s = gen_abs_offset_varpart(&off_linkpl);
+	if (s) {
+		s1 = new_stmt(BPF_LD|BPF_IMM);
+		s1->s.k = 40;
+		sappend(s, s1);
+
+		s1 = new_stmt(BPF_ALU|BPF_ADD|BPF_X);
+		s1->s.k = 0;
+		sappend(s, s1);
+	} else {
+		s = new_stmt(BPF_LD|BPF_IMM);
+		s->s.k = 40;;
+	}
+
+	/* Forcibly append these statements to the true condition
+	 * of the protocol check by creating a new block that is
+	 * always true and ANDing them. */
+	s1 = new_stmt(BPF_MISC|BPF_TAX);
+	sappend(s, s1);
+
+	b1 = new_block(BPF_JMP|BPF_JEQ|BPF_X);
+	b1->stmts = s;
+	b1->s.k = 0;
+
+	gen_and(b0, b1);
+
+	return b1;
+}
+
+/* We need to store three values based on the Geneve header::
+ * - The offset of the linktype.
+ * - The offset of the end of the Geneve header.
+ * - The offset of the end of the encapsulated MAC header. */
+static struct slist *
+gen_geneve_offsets(void)
+{
+	struct slist *s, *s1, *s_proto;
+
+	/* First we need to calculate the offset of the Geneve header
+	 * itself. This is composed of the IP header previously calculated
+	 * (include any variable link prefix) and stored in A plus the
+	 * fixed sized headers (fixed link prefix, MAC length, and UDP
+	 * header). */
+	s = new_stmt(BPF_ALU|BPF_ADD|BPF_K);
+	s->s.k = off_linkpl.constant_part + off_nl + 8;
+
+	/* Stash this in X since we'll need it later. */ 
+	s1 = new_stmt(BPF_MISC|BPF_TAX);
+	sappend(s, s1);
+
+	/* The EtherType in Geneve is 2 bytes in. Calculate this and
+	 * store it. */
+	s1 = new_stmt(BPF_ALU|BPF_ADD|BPF_K);
+	s1->s.k = 2;
+	sappend(s, s1);
+
+	off_linktype.reg = alloc_reg();
+	off_linktype.is_variable = 1;
+	off_linktype.constant_part = 0;
+
+	s1 = new_stmt(BPF_ST);
+	s1->s.k = off_linktype.reg;
+	sappend(s, s1);
+
+	/* Load the Geneve option length and mask and shift to get the
+	 * number of bytes. It is stored in the first byte of the Geneve
+	 * header. */
+	s1 = new_stmt(BPF_LD|BPF_IND|BPF_B);
+	s1->s.k = 0;
+	sappend(s, s1);
+
+	s1 = new_stmt(BPF_ALU|BPF_AND|BPF_K);
+	s1->s.k = 0x3f;
+	sappend(s, s1);
+
+	s1 = new_stmt(BPF_ALU|BPF_MUL|BPF_K);
+	s1->s.k = 4;
+	sappend(s, s1);
+
+	/* Add in the rest of the Geneve base header. */
+	s1 = new_stmt(BPF_ALU|BPF_ADD|BPF_K);
+	s1->s.k = 8;
+	sappend(s, s1);
+
+	/* Add the Geneve header length to its offset and store. */
+	s1 = new_stmt(BPF_ALU|BPF_ADD|BPF_X);
+	s1->s.k = 0;
+	sappend(s, s1);
+
+	/* Set the encapsulated type as Ethernet. Even though we may
+	 * not actually have Ethernet inside there are two reasons this
+	 * is useful:
+	 * - The linktype field is always in EtherType format regardless
+	 *   of whether it is in Geneve or an inner Ethernet frame.
+	 * - The only link layer that we have specific support for is
+	 *   Ethernet. We will confirm that the packet actually is
+	 *   Ethernet at runtime before executing these checks. */
+	PUSH_LINKHDR(DLT_EN10MB, 1, 0, alloc_reg());
+
+	s1 = new_stmt(BPF_ST);
+	s1->s.k = off_linkhdr.reg;
+	sappend(s, s1);
+
+	/* Calculate whether we have an Ethernet header or just raw IP/
+	 * MPLS/etc. If we have Ethernet, advance the end of the MAC offset
+	 * and linktype by 14 bytes so that the network header can be found
+	 * seamlessly. Otherwise, keep what we've calculated already. */
+
+	/* We have a bare jmp so we can't use the optimizer. */
+	no_optimize = 1;
+
+	/* Load the EtherType in the Geneve header, 2 bytes in. */
+	s1 = new_stmt(BPF_LD|BPF_IND|BPF_H);
+	s1->s.k = 2;
+	sappend(s, s1);
+
+	/* Load X with the end of the Geneve header. */
+	s1 = new_stmt(BPF_LDX|BPF_MEM);
+	s1->s.k = off_linkhdr.reg;
+	sappend(s, s1);
+
+	/* Check if the EtherType is Transparent Ethernet Bridging. At the
+	 * end of this check, we should have the total length in X. In
+	 * the non-Ethernet case, it's already there. */
+	s_proto = new_stmt(JMP(BPF_JEQ));
+	s_proto->s.k = ETHERTYPE_TEB;
+	sappend(s, s_proto);
+
+	s1 = new_stmt(BPF_MISC|BPF_TXA);
+	sappend(s, s1);
+	s_proto->s.jt = s1;
+
+	/* Since this is Ethernet, use the EtherType of the payload
+	 * directly as the linktype. Overwrite what we already have. */
+	s1 = new_stmt(BPF_ALU|BPF_ADD|BPF_K);
+	s1->s.k = 12;
+	sappend(s, s1);
+
+	s1 = new_stmt(BPF_ST);
+	s1->s.k = off_linktype.reg;
+	sappend(s, s1);
+
+	/* Advance two bytes further to get the end of the Ethernet
+	 * header. */
+	s1 = new_stmt(BPF_ALU|BPF_ADD|BPF_K);
+	s1->s.k = 2;
+	sappend(s, s1);
+
+	/* Move the result to X. */
+	s1 = new_stmt(BPF_MISC|BPF_TAX);
+	sappend(s, s1);
+
+	/* Store the final result of our linkpl calculation. */
+	off_linkpl.reg = alloc_reg();
+	off_linkpl.is_variable = 1;
+	off_linkpl.constant_part = 0;
+
+	s1 = new_stmt(BPF_STX);
+	s1->s.k = off_linkpl.reg;
+	sappend(s, s1);
+	s_proto->s.jf = s1;
+
+	off_nl = 0;
+
+	return s;
+}
+
+/* Check to see if this is a Geneve packet. */
+struct block *
+gen_geneve(int vni)
+{
+	struct block *b0, *b1;
+	struct slist *s;
+
+	b0 = gen_geneve4(vni);
+	b1 = gen_geneve6(vni);
+
+	gen_or(b0, b1);
+	b0 = b1;
+
+	/* Later filters should act on the payload of the Geneve frame,
+	 * update all of the header pointers. Attach this code so that
+	 * it gets executed in the event that the Geneve filter matches. */
+	s = gen_geneve_offsets();
+
+	b1 = gen_true();
+	sappend(s, b1->stmts);
+	b1->stmts = s;
+
+	gen_and(b0, b1);
+
+	is_geneve = 1;
+
+	return b1;
+}
+
+/* Check that the encapsulated frame has a link layer header
+ * for Ethernet filters. */
+static struct block *
+gen_geneve_ll_check()
+{
+	struct block *b0;
+	struct slist *s, *s1;
+
+	/* The easiest way to see if there is a link layer present
+	 * is to check if the link layer header and payload are not
+	 * the same. */
+
+	/* Geneve always generates pure variable offsets so we can
+	 * compare only the registers. */
+	s = new_stmt(BPF_LD|BPF_MEM);
+	s->s.k = off_linkhdr.reg;
+
+	s1 = new_stmt(BPF_LDX|BPF_MEM);
+	s1->s.k = off_linkpl.reg;
+	sappend(s, s1);
+
+	b0 = new_block(BPF_JMP|BPF_JEQ|BPF_X);
+	b0->stmts = s;
+	b0->s.k = 0;
+	gen_not(b0);
 
 	return b0;
 }
@@ -8494,7 +8833,7 @@ gen_atmtype_abbrev(type)
 		PUSH_LINKHDR(DLT_EN10MB, 0,
 		    off_payload + 2,	/* Ethernet header */
 		    -1);
-		off_linktype = 12;
+		off_linktype.constant_part = off_linkhdr.constant_part + 12;
 		off_linkpl.constant_part = off_linkhdr.constant_part + 14;	/* Ethernet */
 		off_nl = 0;			/* Ethernet II */
 		off_nl_nosnap = 3;		/* 802.3+802.2 */
